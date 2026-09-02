@@ -40,6 +40,22 @@ Updates run `brew upgrade && brew upgrade --cask`, `npm update -g`,
 `pnpm update -g --latest`, and `uv tool upgrade --all` (only for the
 managers found on your machine).
 
+## Manual use
+
+Pressed `N` or `Esc` and changed your mind? Call it directly — the same
+notice, on demand:
+
+```
+qterm-updater           # fresh scan, then the notice with [Y]/[N]/[Esc]
+qterm-updater list      # show the last scan result (instant, no scan)
+qterm-updater update    # update everything now, no prompt
+qterm-updater reset     # clear skip + cache; nag returns next shell
+qterm-updater --help
+```
+
+`qterm-updater` (no args) scans in the foreground, so it takes as long as
+your managers do — `list` is the instant one.
+
 ## Install
 
 From a clone:
