@@ -50,27 +50,18 @@ _qterm_key_reader() {
 
 _qterm_scan_brew() {
   if ! command -v brew >/dev/null 2>&1; then return 0; fi
-  local tmpjson="$QTERM_DIR/brew.json" namest="$QTERM_DIR/brew-names.tsv"
-  brew outdated --json=v2 > "$tmpjson" 2>/dev/null || return 0
-  # namest: name<TAB>current<TAB>new
-  /usr/bin/python3 - "$tmpjson" > "$namest" <<'PY'
+  local tmpout="$QTERM_DIR/brew.outdated.json" tmpinfo="$QTERM_DIR/brew.info.json"
+  brew outdated --json=v2 > "$tmpout" 2>/dev/null || return 0
+  # Fetch desc/homepage for ALL installed packages in one call. This is fast
+  # (cache hit) and lets us resolve any outdated name without a per-pkg lookup.
+  brew info --json=v2 --installed > "$tmpinfo" 2>/dev/null || true
+  /usr/bin/python3 - "$tmpout" "$tmpinfo" <<'PY' >> "$_QTERM_RESULT_TMP"
 import json, sys
-d = json.load(open(sys.argv[1]))
-for sec in ("formulae", "casks"):
-    for f in d.get(sec, []):
-        cur = (f.get("installed_versions") or [f.get("installed_version") or "?"])[-1]
-        print("\t".join([f["name"], cur, f.get("current_version", "?")]))
-PY
-  [[ -s "$namest" ]] || return 0
-  # Batch-fetch desc/homepage via a single `brew info --json=v2` call
-  local pkg_list
-  pkg_list=$(cut -f1 "$namest" | paste -sd' ' -)
-  brew info --json=v2 $pkg_list > "$tmpjson" 2>/dev/null || true
-  /usr/bin/python3 - "$tmpjson" "$namest" <<'PY' >> "$_QTERM_RESULT_TMP"
-import json, sys
+try: outdated = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
 info = {}
 try:
-    d = json.load(open(sys.argv[1]))
+    d = json.load(open(sys.argv[2]))
     for sec in ("formulae", "casks"):
         for f in d.get(sec, []):
             desc = (f.get("desc") or "").replace("\t", " ")
@@ -78,13 +69,17 @@ try:
             info[f["name"]] = (desc, home)
 except Exception:
     pass
-for line in open(sys.argv[2]):
-    parts = line.rstrip("\n").split("\t")
-    if len(parts) < 3: continue
-    name, cur, new = parts[0], parts[1], parts[2]
-    desc, home = info.get(name, ("", ""))
-    print("\t".join(["brew", name, cur, new, desc, home]))
+rows = []
+for sec in ("formulae", "casks"):
+    for f in outdated.get(sec, []):
+        cur = (f.get("installed_versions") or [f.get("installed_version") or "?"])[-1]
+        name = f["name"]
+        new = f.get("current_version", "?")
+        desc, home = info.get(name, ("", ""))
+        rows.append("\t".join(["brew", name, cur, new, desc, home]))
+print("\n".join(rows))
 PY
+  rm -f "$tmpout" "$tmpinfo"
 }
 _qterm_scan_npm() {
   if ! command -v npm >/dev/null 2>&1; then return 0; fi
@@ -131,7 +126,7 @@ for line in sys.stdin:
     if line.startswith(("┌", "├", "└", "─")) or line.startswith("Package"): continue
     cols = [c.strip() for c in line.split() if c.strip()]
     if len(cols) >= 3 and re.match(r"^@?[\w./-]+(?:/[\w.-]+)?$", cols[0]):
-        print("%s\t%s\t%s\t\t" % (cols[0], cols[1], cols[2]))
+        print("pnpm\t%s\t%s\t%s\t\t" % (cols[0], cols[1], cols[2]))
 ' >> "$_QTERM_RESULT_TMP" 2>/dev/null
 }
 
@@ -158,7 +153,7 @@ for name, ver in tools:
     if lat == ver: continue
     desc = (info.get("summary") or "").replace("\t", " ")
     home = info.get("home_page") or ""
-    print(f"{name}\t{ver}\t{lat}\t{desc}\t{home}")
+    print("\t".join(["uv", name, ver, lat, desc, home]))
 PY
 }
 
@@ -193,32 +188,48 @@ _qterm_is_skipped_today() {
 }
 
 # ---- display ----------------------------------------------------------------
+# Truncate to a display width, appending "…" when cut.
+_qterm_trunc() {
+  local s="$1" w="$2"
+  (( ${#s} <= w )) && { printf '%s' "$s"; return; }
+  printf '%s…' "${s[1,$((w-1))]}"
+}
+
 _qterm_render_notice() {
-  local total=0 mgr
-  while IFS=$'\t' read -r mgr _ _ _ _ _; do
-    (( total++ ))
-  done < "$QTERM_RESULT"
+  local total=0
+  total=$(grep -c . "$QTERM_RESULT" 2>/dev/null) || total=0
   (( total > 0 )) || return 1
 
-  printf '\n'
-  printf '\033[1;36m⟳ qterm-updater\033[0m — \033[33m%d\033[0m package update(s) available\n' "$total"
-  printf '\n'
+  # Column widths, adapted to the terminal but clamped to sane bounds.
+  local cols=${COLUMNS:-100}
+  (( cols < 60 )) && cols=60
+  local w_pkg=24 w_ver=11 w_desc
+  # 2 indent + 2 num + 2 gap + pkg + 2 gap + (ver→ver) + 2 gap + desc
+  w_desc=$(( cols - 2 - 2 - 2 - w_pkg - 2 - (w_ver * 2 + 3) - 2 ))
+  (( w_desc < 16 )) && w_desc=16
+  (( w_desc > 60 )) && w_desc=60
 
-  local cur_mgr=""
-  local pkg cur new desc home
+  printf '\n\033[1;36m⟳ qterm-updater\033[0m  \033[2m·\033[0m  \033[33m%d\033[0m update(s) available\n\n' "$total"
+
+  local n=0 cur_mgr="" mgr pkg cur new desc home
   while IFS=$'\t' read -r mgr pkg cur new desc home; do
+    [[ -z "$mgr" ]] && continue
     if [[ "$mgr" != "$cur_mgr" ]]; then
       cur_mgr="$mgr"
-      printf '  \033[1m%s\033[0m\n' "$mgr"
+      # Section header with a rule that spans the table.
+      printf '\n  \033[1;35m%s\033[0m\n' "$mgr"
+      printf '  \033[2m%-2s  %-*s  %-*s  %s\033[0m\n' \
+        '#' "$w_pkg" 'PACKAGE' "$(( w_ver * 2 + 3 ))" 'VERSION' 'DESCRIPTION'
     fi
-    printf '    \033[36m%s\033[0m  %s → \033[33m%s\033[0m\n' "$pkg" "$cur" "$new"
-    if [[ -n "$desc" ]]; then
-      printf '        \033[2m%s\033[0m\n' "$desc"
-    fi
-    if [[ -n "$home" ]]; then
-      printf '        \033[2;37m%s\033[0m\n' "$home"
-    fi
+    (( n++ ))
+    printf '  \033[2m%-2s\033[0m  \033[36m%-*s\033[0m  \033[2m%*s → %-*s\033[0m  %s\n' \
+      "$n" \
+      "$w_pkg" "$(_qterm_trunc "$pkg" $w_pkg)" \
+      "$w_ver" "$(_qterm_trunc "$cur" $w_ver)" \
+      "$w_ver" "$(_qterm_trunc "$new" $w_ver)" \
+      "$(_qterm_trunc "$desc" $w_desc)"
   done < "$QTERM_RESULT"
+
   printf '\n'
   # Footer key hint only appears when the caller is about to prompt.
   if [[ "${_QTERM_PROMPT:-0}" == "1" ]]; then
@@ -300,6 +311,35 @@ fi
 # qterm-updater list       — show cached notice (no scan)
 # qterm-updater update     — update all managers now (no prompt)
 # qterm-updater reset      — forget skip + cache (nag re-appears next shell)
+
+_qterm_scan_with_spinner() {
+  # Run the scan in the background while a spinner ticks on this line.
+  # Works because every scanner only appends to $_QTERM_RESULT_TMP.
+  local label="Scanning ${QTERM_MANAGERS[*]:gs/ / \/ /}"
+  _qterm_scan &
+  local pid=$!
+
+  # Skip the spinner entirely when stdout is not a tty (pipes, CI).
+  if [[ ! -t 1 ]]; then
+    printf '%s…\n' "$label"
+    wait "$pid"
+    return
+  fi
+
+  local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local i=0 elapsed
+  tput civis 2>/dev/null  # hide cursor
+  while kill -0 "$pid" 2>/dev/null; do
+    elapsed=$(( SECONDS ))
+    printf '\r  \033[36m%s\033[0m %s… \033[2m%ds\033[0m  ' \
+      "${frames[$(( i % 10 + 1 ))]}" "$label" "$elapsed"
+    (( i++ ))
+    sleep 0.1
+  done
+  wait "$pid"
+  printf '\r\033[2K\033[0m'  # clear spinner line, restore cursor
+  tput cnorm 2>/dev/null
+}
 qterm-updater() {
   local cmd="${1:-check}"
   case "$cmd" in
@@ -311,8 +351,7 @@ qterm-updater() {
       printf '  reset    Clear skip + cache — nag re-appears next shell\n'
       ;;
     check)
-      printf 'Scanning brew / npm / pnpm / uv…\n'
-      _qterm_scan
+      _qterm_scan_with_spinner
       _QTERM_PROMPT=1 _qterm_render_notice || {
         printf 'Everything is up to date.\n'
         return 0

@@ -15,15 +15,17 @@ terminal running zsh), it scans these managers **in the background**:
 delta, description, and homepage:
 
 ```
-⟳ qterm-updater — 12 package update(s) available
+⟳ qterm-updater  ·  12 update(s) available
 
   brew
-    ripgrep  14.1.0 → 14.2.0
-        Fast regex search tool
-        https://github.com/BurntSushi/ripgrep
+  #   PACKAGE                VERSION                  DESCRIPTION
+  1   ripgrep                14.1.0 → 14.2.0          Fast regex search tool
+  2   ghostty                1.1.0   → 1.2.0          Terminal emulator
+  3   …
+
   npm
-    claude  2.1.240 → 2.1.241
-        CLI for Claude
+  #   PACKAGE                VERSION                  DESCRIPTION
+  4   claude                 2.1.240 → 2.1.241        CLI for Claude
 
   [Y] update now   [N] Skip   [Esc] Cancel
 ```
