@@ -83,15 +83,17 @@ PY
 }
 _qterm_scan_npm() {
   if ! command -v npm >/dev/null 2>&1; then return 0; fi
+  local stage="$_QTERM_RESULT_TMP.npm"
+  : > "$stage"          # truncate — otherwise a stale file doubles every row
   # Capture stdout even when npm exits 1 (outdated → exit 1)
   local out
   out=$(npm outdated -g --json 2>&1) || true
   [[ -z "$out" ]] && return 0
   # First non-`{` line might be a warning; strip leading junk
-  local i j
+  local i
   i=$(print -r -- "$out" | awk 'index($0,"{"){print NR; exit}')
   [[ -n "$i" ]] && out=$(print -r -- "$out" | tail -n +"$i")
-  /usr/bin/python3 - "$out" <<'PY' >> "$_QTERM_RESULT_TMP.tmp" 2>/dev/null
+  /usr/bin/python3 - "$out" <<'PY' >> "$stage" 2>/dev/null
 import json, sys
 raw = sys.argv[1]
 i = raw.find("{")
@@ -100,20 +102,18 @@ if i < 0 or j < 0: sys.exit(0)
 try: d = json.loads(raw[i:j+1])
 except Exception: sys.exit(0)
 for name, v in d.items():
-    cur = v.get("current", "?")
-    lat = v.get("latest", "?")
-    print("\t".join([name, cur, lat]))
+    print("\t".join([name, v.get("current", "?"), v.get("latest", "?")]))
 PY
   # Enrich with description/homepage via one `npm view` per pkg.
-  # `npm view pkg description` prints just the string.
   local name cur lat desc home
   while IFS=$'\t' read -r name cur lat; do
+    [[ -z "$name" ]] && continue
     desc=$(npm view "$name" description 2>/dev/null)
     home=$(npm view "$name" homepage 2>/dev/null)
     desc="${desc//$'\t'/ }"
     printf 'npm\t%s\t%s\t%s\t%s\t%s\n' "$name" "$cur" "$lat" "$desc" "$home" >> "$_QTERM_RESULT_TMP"
-  done < "$_QTERM_RESULT_TMP.tmp"
-  rm -f "$_QTERM_RESULT_TMP.tmp"
+  done < "$stage"
+  rm -f "$stage"
 }
 
 _qterm_scan_pnpm() {
@@ -158,16 +158,25 @@ PY
 }
 
 _qterm_scan() {
-  # Writes to a scratch file, then swaps it in as the cached result.
-  # Safe to call in the foreground (manual `qterm-updater`) or backgrounded.
+  # Writes to a per-PID scratch file, then atomically swaps it in as the
+  # cached result. Safe in the foreground (manual `qterm-updater`) and from
+  # the boot-time background job: a scan that finishes while a NEWER scan
+  # has already completed abandons its result instead of clobbering it.
+  local started
+  started=$(date +%s)
   _QTERM_RESULT_TMP="$QTERM_RESULT.scan.$$"
   : > "$_QTERM_RESULT_TMP"
   local mgr
   for mgr in "${QTERM_MANAGERS[@]}"; do
     "_qterm_scan_${mgr}" 2>/dev/null
   done
-  grep -v '^$' "$_QTERM_RESULT_TMP" > "$QTERM_RESULT" 2>/dev/null || : > "$QTERM_RESULT"
-  rm -f "$_QTERM_RESULT_TMP"
+  grep -v '^[[:space:]]*$' "$_QTERM_RESULT_TMP" > "${_QTERM_RESULT_TMP}.f" 2>/dev/null
+  mv -f "${_QTERM_RESULT_TMP}.f" "$_QTERM_RESULT_TMP"
+  if [[ -f "$QTERM_LAST" ]] && (( $(cat "$QTERM_LAST" 2>/dev/null || echo 0) > started )); then
+    rm -f "$_QTERM_RESULT_TMP"
+    return 0
+  fi
+  mv -f "$_QTERM_RESULT_TMP" "$QTERM_RESULT"
   date +%s > "$QTERM_LAST"
 }
 
@@ -239,19 +248,49 @@ _qterm_render_notice() {
 }
 
 _qterm_apply_updates() {
-  printf '\n\033[1;36m⟳ Updating…\033[0m\n'
-  (
-    local mgr
-    for mgr in "${QTERM_MANAGERS[@]}"; do
-      case "$mgr" in
-        brew) [[ -x "$(command -v brew)" ]] && { brew update >/dev/null 2>&1 && brew upgrade >/dev/null 2>&1 && brew upgrade --cask >/dev/null 2>&1; } ;;
-        npm)  [[ -x "$(command -v npm)"  ]] && npm update -g >/dev/null 2>&1 ;;
-        pnpm) [[ -x "$(command -v pnpm)" ]] && pnpm update -g --latest >/dev/null 2>&1 ;;
-        uv)   [[ -x "$(command -v uv)"   ]] && uv tool upgrade --all >/dev/null 2>&1 ;;
-      esac
-    done
-    printf ' done. Re-scan tomorrow.\n'
-  ) &
+  # Run each manager's update in a child process so the user's shell stays
+  # responsive. Each update streams its own output, prefixed with a tag, so
+  # the user can watch progress in real time. We wait between managers (not
+  # at the end) so failed ones don't get buried in a torrent of output.
+  printf '\n\033[1;36m⟳ Updating %s…\033[0m\n' "${QTERM_MANAGERS[*]}"
+  local mgr start end
+  for mgr in "${QTERM_MANAGERS[@]}"; do
+    case "$mgr" in
+      brew)
+        if ! command -v brew >/dev/null 2>&1; then continue; fi
+        printf '\n\033[1;35m── brew ──\033[0m\n'
+        start=$SECONDS
+        brew update && brew upgrade && brew upgrade --cask
+        end=$SECONDS
+        printf '\033[2mbrew done in %ds.\033[0m\n' $(( end - start ))
+        ;;
+      npm)
+        if ! command -v npm >/dev/null 2>&1; then continue; fi
+        printf '\n\033[1;35m── npm ──\033[0m\n'
+        start=$SECONDS
+        npm update -g
+        end=$SECONDS
+        printf '\033[2mnpm done in %ds.\033[0m\n' $(( end - start ))
+        ;;
+      pnpm)
+        if ! command -v pnpm >/dev/null 2>&1; then continue; fi
+        printf '\n\033[1;35m── pnpm ──\033[0m\n'
+        start=$SECONDS
+        pnpm update -g --latest
+        end=$SECONDS
+        printf '\033[2mpnpm done in %ds.\033[0m\n' $(( end - start ))
+        ;;
+      uv)
+        if ! command -v uv >/dev/null 2>&1; then continue; fi
+        printf '\n\033[1;35m── uv ──\033[0m\n'
+        start=$SECONDS
+        uv tool upgrade --all
+        end=$SECONDS
+        printf '\033[2muv done in %ds.\033[0m\n' $(( end - start ))
+        ;;
+    esac
+  done
+  printf '\n\033[1;32m✓ all updates finished.\033[0m Re-scan tomorrow.\n\n'
   rm -f "$QTERM_SKIP"
 }
 
