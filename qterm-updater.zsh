@@ -9,11 +9,9 @@
 # at the end of your .zshrc.
 
 # ---- guards -----------------------------------------------------------------
-# Skip in non-interactive, CI, dumb terminal, or when re-sourced in the same shell.
-if [[ ! -o interactive ]] || [[ -n "$CI" || "$TERM" == "dumb" || ! -t 1 ]]; then
-  return 0
-fi
-if (( ${+functions[qterm_updater_nag]} )); then
+# Skip in CI / dumb terminal / when re-sourced. We still define the manual CLI
+# in those cases so `qterm-updater list` / `update` work in scripts.
+if [[ -n "$CI" || "$TERM" == "dumb" ]] || (( ${+functions[qterm-updater]} )); then
   return 0
 fi
 
@@ -165,17 +163,17 @@ PY
 }
 
 _qterm_scan() {
-  # Background subshell. Writes to tmp, then atomically renames to result.
+  # Writes to a scratch file, then swaps it in as the cached result.
+  # Safe to call in the foreground (manual `qterm-updater`) or backgrounded.
   _QTERM_RESULT_TMP="$QTERM_RESULT.scan.$$"
   : > "$_QTERM_RESULT_TMP"
   local mgr
   for mgr in "${QTERM_MANAGERS[@]}"; do
-    "qterm_scan_${mgr}" 2>/dev/null
+    "_qterm_scan_${mgr}" 2>/dev/null
   done
-  # Filter empty lines
-  grep -v '^$' "$_QTERM_RESULT_TMP" 2>/dev/null > "$QTERM_RESULT" || mv -f "$_QTERM_RESULT_TMP" "$QTERM_RESULT"
+  grep -v '^$' "$_QTERM_RESULT_TMP" > "$QTERM_RESULT" 2>/dev/null || : > "$QTERM_RESULT"
   rm -f "$_QTERM_RESULT_TMP"
-  print -r -- "$(date +%s)" > "$QTERM_LAST"
+  date +%s > "$QTERM_LAST"
 }
 
 _qterm_needs_scan() {
@@ -222,7 +220,10 @@ _qterm_render_notice() {
     fi
   done < "$QTERM_RESULT"
   printf '\n'
-  printf '  \033[1;32m[Y]\033[0m update now   \033[1;32m[N]\033[0m Skip   \033[1;32m[Esc]\033[0m Cancel\n'
+  # Footer key hint only appears when the caller is about to prompt.
+  if [[ "${_QTERM_PROMPT:-0}" == "1" ]]; then
+    printf '  \033[1;32m[Y]\033[0m update now   \033[1;32m[N]\033[0m Skip   \033[1;32m[Esc]\033[0m Cancel\n'
+  fi
   return 0
 }
 
@@ -238,7 +239,7 @@ _qterm_apply_updates() {
         uv)   [[ -x "$(command -v uv)"   ]] && uv tool upgrade --all >/dev/null 2>&1 ;;
       esac
     done
-    print -r -- " done. Re-scan tomorrow."
+    printf ' done. Re-scan tomorrow.\n'
   ) &
   rm -f "$QTERM_SKIP"
 }
@@ -252,7 +253,7 @@ qterm_updater_nag() {
   (( _QTERM_SHOWN )) && return 0
   _qterm_is_skipped_today && return 0
   [[ -f "$QTERM_RESULT" ]] || return 0
-  _qterm_render_notice || return 0
+  _QTERM_PROMPT=1 _qterm_render_notice || return 0
   printf '\n'
 
   local key
@@ -294,6 +295,59 @@ if _qterm_needs_scan; then
   fi
 fi
 
-# Hook into precmd (after Powerlevel10k / Starship finish rendering).
-autoload -U add-zsh-hook 2>/dev/null
-add-zsh-hook precmd qterm_updater_nag 2>/dev/null || precmd_functions+=(qterm_updater_nag)
+# ---- manual CLI ---------------------------------------------------------------
+# qterm-updater            — scan now (fresh, blocking) then show the notice
+# qterm-updater list       — show cached notice (no scan)
+# qterm-updater update     — update all managers now (no prompt)
+# qterm-updater reset      — forget skip + cache (nag re-appears next shell)
+qterm-updater() {
+  local cmd="${1:-check}"
+  case "$cmd" in
+    -h|--help|help)
+      printf 'usage: qterm-updater [check|list|update|reset]\n'
+      printf '  check    Scan now (blocking) and show the notice (default)\n'
+      printf '  list     Show the most recent cached notice (no scan)\n'
+      printf '  update   Update all managers immediately, no prompt\n'
+      printf '  reset    Clear skip + cache — nag re-appears next shell\n'
+      ;;
+    check)
+      printf 'Scanning brew / npm / pnpm / uv…\n'
+      _qterm_scan
+      _QTERM_PROMPT=1 _qterm_render_notice || {
+        printf 'Everything is up to date.\n'
+        return 0
+      }
+      printf '\n'
+      local key
+      key=$(_qterm_key_reader)
+      case "$key" in
+        yes) _qterm_apply_updates ;;
+        *)   printf '  (no action taken)\n' ;;
+      esac
+      printf '\n'
+      ;;
+    list)
+      if [[ ! -s "$QTERM_RESULT" ]]; then
+        printf 'No scan yet. Run: qterm-updater\n'
+        return 0
+      fi
+      _qterm_render_notice || printf 'Everything up to date (per last scan).\n'
+      ;;
+    update)
+      _qterm_apply_updates
+      ;;
+    reset)
+      rm -f "$QTERM_SKIP" "$QTERM_RESULT" "$QTERM_LAST"
+      printf 'Cleared. The nag will re-scan on the next shell.\n'
+      ;;
+    *)
+      printf 'usage: qterm-updater [check|list|update|reset]\n'
+      ;;
+  esac
+}
+
+# ---- interactive shell wiring (notice + precmd hook) --------------------------
+if [[ -o interactive ]] && [[ -t 1 ]]; then
+  autoload -U add-zsh-hook 2>/dev/null
+  add-zsh-hook precmd qterm_updater_nag 2>/dev/null || precmd_functions+=(qterm_updater_nag)
+fi
