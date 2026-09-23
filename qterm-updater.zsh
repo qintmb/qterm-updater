@@ -45,17 +45,21 @@ _qterm_key_reader() {
 
 # ---- scan functions ---------------------------------------------------------
 # Each writes tsv rows (manager<TAB>pkg<TAB>cur<TAB>new<TAB>desc<TAB>home) to
-# the file referenced by $_QTERM_RESULT_TMP. Failed/unavailable managers are
-# silent — `command -v` guards ensure we never error in a user's shell.
+# the file referenced by $_QTERM_RESULT_TMP. A failed manager leaves at most
+# the rows it had emitted — one command can never blank out the whole table.
 
 _qterm_scan_brew() {
   if ! command -v brew >/dev/null 2>&1; then return 0; fi
+  local stage="$_QTERM_RESULT_TMP.brew"
+  : > "$stage"
   local tmpout="$QTERM_DIR/brew.outdated.json" tmpinfo="$QTERM_DIR/brew.info.json"
-  brew outdated --json=v2 > "$tmpout" 2>/dev/null || return 0
-  # Fetch desc/homepage for ALL installed packages in one call. This is fast
-  # (cache hit) and lets us resolve any outdated name without a per-pkg lookup.
-  brew info --json=v2 --installed > "$tmpinfo" 2>/dev/null || true
-  /usr/bin/python3 - "$tmpout" "$tmpinfo" <<'PY' >> "$_QTERM_RESULT_TMP"
+  brew outdated --json=v2 > "$tmpout" 2>/dev/null || { rm -f "$tmpout"; return 0; }
+  # Fetch desc/homepage for the ~1000 OUTDATED packages in one call — the full
+  # --installed set would hang on Intel Macs (251+ formulae, several minutes).
+  brew info --json=v2 $(< <(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(" ".join(f["name"] for sec in ("formulae","casks") for f in d.get(sec,[])))' "$tmpout")) > "$tmpinfo" 2>/dev/null || true
+  /usr/bin/python3 - "$tmpout" "$tmpinfo" <<'PY' >> "$stage"
 import json, sys
 try: outdated = json.load(open(sys.argv[1]))
 except Exception: sys.exit(0)
@@ -80,6 +84,8 @@ for sec in ("formulae", "casks"):
 print("\n".join(rows))
 PY
   rm -f "$tmpout" "$tmpinfo"
+  cat "$stage" >> "$_QTERM_RESULT_TMP"
+  rm -f "$stage"
 }
 _qterm_scan_npm() {
   if ! command -v npm >/dev/null 2>&1; then return 0; fi
@@ -247,51 +253,102 @@ _qterm_render_notice() {
   return 0
 }
 
+_qterm_fmtsecs() {
+  # 3754 -> "1h02m", 125 -> "2m05s", 7 -> "7s"
+  local s=$1
+  (( s >= 3600 )) && { printf '%dh%02dm' $(( s / 3600 )) $(( (s % 3600) / 60 )); return; }
+  (( s >= 60 ))   && { printf '%dm%02ds' $(( s / 60 )) $(( s % 60 )); return; }
+  printf '%ds' "$s"
+}
+
 _qterm_apply_updates() {
-  # Run each manager's update in a child process so the user's shell stays
-  # responsive. Each update streams its own output, prefixed with a tag, so
-  # the user can watch progress in real time. We wait between managers (not
-  # at the end) so failed ones don't get buried in a torrent of output.
-  printf '\n\033[1;36m⟳ Updating %s…\033[0m\n' "${QTERM_MANAGERS[*]}"
-  local mgr start end
-  for mgr in "${QTERM_MANAGERS[@]}"; do
+  # Update one package at a time so progress is visible: a live spinner line
+  # per package (name, version bump, elapsed), then a ✓/✗ line. Raw output
+  # goes to a log file; on failure the last lines are shown.
+  local log="$QTERM_DIR/update.log" n=0 ok=0 fail=0 start st
+  : > "$log"
+  local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local -i fi=0
+
+  if [[ ! -s "$QTERM_RESULT" ]]; then
+    # No scan data — fall back to whole-manager upgrades.
+    printf '\n\033[1;36m⟳ Updating %s…\033[0m\n' "${QTERM_MANAGERS[*]}"
+    local mgr
+    for mgr in "${QTERM_MANAGERS[@]}"; do
+      command -v "$mgr" >/dev/null 2>&1 || continue
+      printf '\n\033[1;35m── %s ──\033[0m\n' "$mgr"
+      start=$SECONDS
+      case "$mgr" in
+        brew) brew update && brew upgrade && brew upgrade --cask ;;
+        npm)  npm update -g ;;
+        pnpm) pnpm update -g --latest ;;
+        uv)   uv tool upgrade --all ;;
+      esac
+      printf '\033[2m%s done in %s.\033[0m\n' "$mgr" "$(_qterm_fmtsecs $(( SECONDS - start )))"
+    done
+    printf '\n\033[1;32m✓ all updates finished.\033[0m Re-scanning to verify…\n\n'
+    rm -f "$QTERM_SKIP"
+    _qterm_scan
+    return
+  fi
+
+  local total
+  total=$(grep -c . "$QTERM_RESULT" 2>/dev/null) || total=0
+  printf '\n\033[1;36m⟳ Updating %d package(s), one by one — full log: \033[2m%s\033[0m\n\n' "$total" "$log"
+
+  local mgr cur_mgr="" pkg cur new desc home
+  while IFS=$'\t' read -r mgr pkg cur new desc home; do
+    [[ -z "$mgr" ]] && continue
+    if [[ "$mgr" != "$cur_mgr" ]]; then
+      [[ -n "$cur_mgr" ]] && printf '\n'
+      cur_mgr="$mgr"
+      printf '\033[1;35m── %s ──\033[0m\n' "$mgr"
+      [[ "$mgr" == brew ]] && { printf '  \033[2mbrew update…\033[0m'; brew update >> "$log" 2>&1; printf '\r\033[2K  \033[2mbrew update ok\033[0m\n'; }
+    fi
+    command -v "$mgr" >/dev/null 2>&1 || continue
+    (( n++ ))
+    local -a cmd
     case "$mgr" in
-      brew)
-        if ! command -v brew >/dev/null 2>&1; then continue; fi
-        printf '\n\033[1;35m── brew ──\033[0m\n'
-        start=$SECONDS
-        brew update && brew upgrade && brew upgrade --cask
-        end=$SECONDS
-        printf '\033[2mbrew done in %ds.\033[0m\n' $(( end - start ))
-        ;;
-      npm)
-        if ! command -v npm >/dev/null 2>&1; then continue; fi
-        printf '\n\033[1;35m── npm ──\033[0m\n'
-        start=$SECONDS
-        npm update -g
-        end=$SECONDS
-        printf '\033[2mnpm done in %ds.\033[0m\n' $(( end - start ))
-        ;;
-      pnpm)
-        if ! command -v pnpm >/dev/null 2>&1; then continue; fi
-        printf '\n\033[1;35m── pnpm ──\033[0m\n'
-        start=$SECONDS
-        pnpm update -g --latest
-        end=$SECONDS
-        printf '\033[2mpnpm done in %ds.\033[0m\n' $(( end - start ))
-        ;;
-      uv)
-        if ! command -v uv >/dev/null 2>&1; then continue; fi
-        printf '\n\033[1;35m── uv ──\033[0m\n'
-        start=$SECONDS
-        uv tool upgrade --all
-        end=$SECONDS
-        printf '\033[2muv done in %ds.\033[0m\n' $(( end - start ))
-        ;;
+      brew) cmd=(brew upgrade "$pkg") ;;
+      npm)  cmd=(npm install -g "${pkg}@latest") ;;
+      pnpm) cmd=(pnpm update -g --latest "$pkg") ;;
+      uv)   cmd=(uv tool upgrade "$pkg") ;;
     esac
-  done
-  printf '\n\033[1;32m✓ all updates finished.\033[0m Re-scan tomorrow.\n\n'
+    start=$SECONDS
+    "$cmd[@]" >> "$log" 2>&1 < /dev/null &
+    local pid=$!
+    if [[ -t 1 ]]; then
+      while kill -0 "$pid" 2>/dev/null; do
+        printf '\r  [%2d/%2d] \033[36m%s\033[0m %-24s %s → %s \033[2m%s\033[0m  ' \
+          "$n" "$total" "${frames[$(( fi % 10 + 1 ))]}" \
+          "$(_qterm_trunc "$pkg" 24)" "$(_qterm_trunc "$cur" 11)" "$(_qterm_trunc "$new" 11)" \
+          "$(_qterm_fmtsecs $(( SECONDS - start )))"
+        (( fi++ ))
+        sleep 0.2
+      done
+    else
+      printf '  [%2d/%2d] %s %s → %s…\n' "$n" "$total" "$pkg" "$cur" "$new"
+    fi
+    wait "$pid"; st=$?
+    if (( st == 0 )); then
+      (( ok++ ))
+      printf '\r\033[2K  [%2d/%2d] \033[32m✓\033[0m %-24s %s → %s \033[2m(%s)\033[0m\n' \
+        "$n" "$total" "$(_qterm_trunc "$pkg" 24)" "$(_qterm_trunc "$cur" 11)" "$(_qterm_trunc "$new" 11)" \
+        "$(_qterm_fmtsecs $(( SECONDS - start )))"
+    else
+      (( fail++ ))
+      printf '\r\033[2K  [%2d/%2d] \033[31m✗\033[0m %-24s %s → %s \033[2m(%s)\033[0m\n' \
+        "$n" "$total" "$(_qterm_trunc "$pkg" 24)" "$(_qterm_trunc "$cur" 11)" "$(_qterm_trunc "$new" 11)" \
+        "$(_qterm_fmtsecs $(( SECONDS - start )))"
+      tail -n 4 "$log" | sed 's/^/        /'
+    fi
+  done < "$QTERM_RESULT"
+
+  printf '\n\033[1;32m✓ %d updated\033[0m' "$ok"
+  (( fail > 0 )) && printf '\033[1;31m, %d failed\033[0m' "$fail"
+  printf ' \033[2m— log: %s\033[0m\nRe-scanning to verify…\n\n' "$log"
   rm -f "$QTERM_SKIP"
+  _qterm_scan
 }
 
 # ---- nag (called by precmd) -------------------------------------------------
@@ -335,15 +392,30 @@ qterm_updater_nag() {
   printf '\n'
 }
 
+_qterm_bg_scan() {
+  # Boot-time background scan, SIGHUP-proof (&! = bg + disown, so closing the
+  # terminal mid-scan no longer kills it) and guarded by a stale-tolerant lock:
+  # a lock left behind by a killed shell used to block every future scan.
+  if ! mkdir "$QTERM_DIR/lock" 2>/dev/null; then
+    local mtime
+    mtime=$(stat -f %m "$QTERM_DIR/lock" 2>/dev/null) || \
+      mtime=$(stat -c %Y "$QTERM_DIR/lock" 2>/dev/null) || return 0
+    (( $(date +%s) - mtime < 1800 )) && return 0
+    rm -rf "$QTERM_DIR/lock"
+    mkdir "$QTERM_DIR/lock" 2>/dev/null || return 0
+  fi
+  ( _qterm_scan &! ) 2>/dev/null
+  trap "rmdir '$QTERM_DIR/lock' 2>/dev/null" EXIT INT HUP
+}
+
 # ---- boot -------------------------------------------------------------------
 # 1) If we need to scan, do it in the background (non-blocking).
 # 2) Wire the nag into precmd so the notice appears after the prompt renders.
+# 3) Drop scratch files from scans that were killed mid-run.
 if _qterm_needs_scan; then
-  if mkdir "$QTERM_DIR/lock" 2>/dev/null; then
-    ( _qterm_scan & ) &>/dev/null
-    trap "rmdir '$QTERM_DIR/lock' 2>/dev/null" EXIT INT HUP
-  fi
+  _qterm_bg_scan
 fi
+find "$QTERM_DIR" -name 'result.scan.*' -mtime +0 -delete 2>/dev/null
 
 # ---- manual CLI ---------------------------------------------------------------
 # qterm-updater            — scan now (fresh, blocking) then show the notice
