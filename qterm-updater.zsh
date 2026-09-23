@@ -404,8 +404,9 @@ _qterm_bg_scan() {
     rm -rf "$QTERM_DIR/lock"
     mkdir "$QTERM_DIR/lock" 2>/dev/null || return 0
   fi
-  ( _qterm_scan &! ) 2>/dev/null
-  trap "rmdir '$QTERM_DIR/lock' 2>/dev/null" EXIT INT HUP
+  # The scan owns the lock: it is disowned, so it may outlive this shell, and
+  # a trap here would free the lock while the scan is still running.
+  ( _qterm_scan; rmdir "$QTERM_DIR/lock" 2>/dev/null ) &!
 }
 
 # ---- boot -------------------------------------------------------------------
