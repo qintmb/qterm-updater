@@ -15,8 +15,9 @@ type Styles struct {
 	Section    lipgloss.Style
 	Header     lipgloss.Style
 	TableHeader lipgloss.Style
-	TableRow   lipgloss.Style
-	TableCur   lipgloss.Style
+	TableRow    lipgloss.Style
+	TableRowDim lipgloss.Style
+	TableCur    lipgloss.Style
 	Mark       lipgloss.Style
 	Footer     lipgloss.Style
 	Tile       lipgloss.Style
@@ -40,6 +41,7 @@ func Default() Styles {
 		Header:      base.Bold(true).Foreground(lipgloss.Color("7")),
 		TableHeader: base.Bold(true).Foreground(lipgloss.Color("8")),
 		TableRow:    base.Padding(0, 1).Foreground(lipgloss.Color("7")),
+		TableRowDim: base.Padding(0, 1).Foreground(lipgloss.Color("8")),
 		TableCur:    base.Padding(0, 1).Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("4")),
 		Mark:        base.Foreground(lipgloss.Color("3")),
 		Footer:      base.Padding(0, 1).Foreground(lipgloss.Color("8")),
