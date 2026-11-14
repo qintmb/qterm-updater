@@ -22,8 +22,8 @@ func Dir() string {
 
 // Cache is the on-disk scan result.
 type Cache struct {
-	ScannedAt time.Time      `json:"scanned_at"`
-	Rows      []scan.Row     `json:"rows"`
+	ScannedAt time.Time         `json:"scanned_at"`
+	Rows      []scan.Row        `json:"rows"`
 	Errors    map[string]string `json:"errors,omitempty"`
 }
 
@@ -81,14 +81,14 @@ func ClearSkip() { _ = os.Remove(filepath.Join(Dir(), "skip_until")) }
 
 // History is one finished job.
 type HistoryEntry struct {
-	StartedAt time.Time     `json:"started_at"`
-	EndedAt   time.Time     `json:"ended_at"`
-	Pkg       string        `json:"pkg"`
-	Manager   string        `json:"manager"`
-	From      string        `json:"from"`
-	To        string        `json:"to"`
-	OK        bool          `json:"ok"`
-	Output    string        `json:"output,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at"`
+	Pkg       string    `json:"pkg"`
+	Manager   string    `json:"manager"`
+	From      string    `json:"from"`
+	To        string    `json:"to"`
+	OK        bool      `json:"ok"`
+	Output    string    `json:"output,omitempty"`
 }
 
 // LoadHistory reads all finished jobs, newest first.
