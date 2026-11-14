@@ -32,8 +32,13 @@ From source:
 ```sh
 git clone https://github.com/qintmb/qterm-updater.git
 cd qterm-updater
-go build -o ~/.local/bin/qterm-updater ./cmd/qterm-updater
+make install
 ```
+
+`make install` builds with the version stamped from `git describe` and copies
+the binary to `~/.local/bin`. Override the target with `PREFIX=/usr/local`.
+Re-run it after every `git pull` — an old binary in `PATH` looks exactly like
+an old build.
 
 ## Usage
 
